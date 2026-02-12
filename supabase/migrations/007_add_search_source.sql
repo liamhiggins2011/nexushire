@@ -1,0 +1,5 @@
+ALTER TABLE candidates ADD COLUMN IF NOT EXISTS source_platform TEXT DEFAULT 'linkedin';
+ALTER TABLE candidates ADD COLUMN IF NOT EXISTS stackoverflow_url TEXT;
+ALTER TABLE search_history ADD COLUMN IF NOT EXISTS query_count INTEGER DEFAULT 1;
+ALTER TABLE search_history ADD COLUMN IF NOT EXISTS wide_net BOOLEAN DEFAULT false;
+ALTER TABLE search_history ADD COLUMN IF NOT EXISTS pages_fetched INTEGER DEFAULT 1;
