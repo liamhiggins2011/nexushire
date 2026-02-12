@@ -9,6 +9,7 @@ import { FilterSidebar, DEFAULT_FILTERS } from "@/components/search/filter-sideb
 import { TalentMap } from "@/components/search/talent-map";
 import { DorkPreview } from "@/components/search/dork-preview";
 import { SourcingProgress } from "@/components/search/sourcing-progress";
+import { LiveFeed } from "@/components/search/live-feed";
 import { ShortlistPanel } from "@/components/shortlist/shortlist-panel";
 import { CandidateDetail } from "@/components/candidate/candidate-detail";
 import { Header } from "@/components/layout/header";
@@ -33,6 +34,7 @@ export default function HomePage() {
     previews,
     progress,
     queries,
+    activities,
     error,
     hasMore,
     search,
@@ -234,6 +236,13 @@ export default function HomePage() {
             {progress && isSearching && (
               <div className="mb-4">
                 <SourcingProgress progress={progress} />
+              </div>
+            )}
+
+            {/* Live Feed */}
+            {isSearching && activities.length > 0 && (
+              <div className="mb-4">
+                <LiveFeed activities={activities} />
               </div>
             )}
 

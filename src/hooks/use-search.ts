@@ -3,6 +3,8 @@
 import { useState, useCallback, useRef } from "react";
 import { Candidate, PreviewCandidate, SearchProgressEvent } from "@/types";
 
+const MAX_ACTIVITIES = 50;
+
 interface SearchState {
   isSearching: boolean;
   status: string;
@@ -11,6 +13,7 @@ interface SearchState {
   previews: PreviewCandidate[];
   progress: SearchProgressEvent | null;
   queries: string[];
+  activities: string[];
   error: string | null;
   hasMore: boolean;
   nextOffset: number;
@@ -30,6 +33,7 @@ export function useSearch() {
     previews: [],
     progress: null,
     queries: [],
+    activities: [],
     error: null,
     hasMore: false,
     nextOffset: 0,
@@ -51,6 +55,7 @@ export function useSearch() {
           previews: [],
           progress: null,
           queries: [],
+          activities: [],
           error: null,
           hasMore: false,
           nextOffset: 0,
@@ -139,6 +144,13 @@ export function useSearch() {
                     ...prev,
                     progress: data as SearchProgressEvent,
                     status: (data as SearchProgressEvent).detail,
+                  }));
+                  break;
+
+                case "activity":
+                  setState((prev) => ({
+                    ...prev,
+                    activities: [...prev.activities.slice(-MAX_ACTIVITIES + 1), data as string],
                   }));
                   break;
 

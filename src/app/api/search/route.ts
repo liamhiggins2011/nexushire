@@ -20,22 +20,58 @@ import {
 import { deduplicateResults, filterExistingCandidates } from "@/lib/deduplication";
 import { generateCrossPlatformQueries } from "@/lib/query-diversifier";
 
-const firecrawlLimiter = new RateLimiter(3, 500);
-const claudeLimiter = new RateLimiter(2, 300);
+const firecrawlLimiter = new RateLimiter(5, 300);
+const claudeLimiter = new RateLimiter(4, 200);
 
 function encodeSSE(event: string, data: unknown): string {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
-async function processProfile(
+function extractNameFromSerper(title: string): string {
+  return title
+    .replace(/\s*[-–|·]\s*(LinkedIn|GitHub|Stack Overflow).*$/i, "")
+    .split(/\s*[-–·|]\s*/)[0]
+    .trim();
+}
+
+// Fast snippet-based extraction: parse Serper title/snippet without Firecrawl or Claude
+function extractFromSnippet(result: SerperResult): Partial<Candidate> {
+  const cleanTitle = result.title.replace(/\s*[\|·\-–]\s*LinkedIn$/i, "").trim();
+  const parts = cleanTitle.split(/\s*[-–·|]\s*/);
+  const name = parts[0]?.trim() || "Unknown";
+  const headline = parts.slice(1).join(" - ").trim() || null;
+
+  // Try to extract location from snippet
+  const locationMatch = result.snippet.match(
+    /(?:Location|Based in|in)\s*[:.]?\s*([A-Z][a-zA-Z\s,]+(?:Area|States|City)?)/
+  ) || result.snippet.match(
+    /([A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z]+)*,\s*[A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z]+)*)/
+  );
+
+  return {
+    full_name: name,
+    headline,
+    current_title: headline,
+    profile_url: result.link,
+    location: locationMatch?.[1]?.trim() || null,
+    fit_score: null,
+    fit_reasoning: null,
+  };
+}
+
+// Full enrichment: Firecrawl scrape + Claude extraction + Claude ranking
+async function enrichProfile(
   result: SerperResult,
   query: string,
-  supabase: ReturnType<typeof createServerClient>
+  supabase: ReturnType<typeof createServerClient>,
+  send: (event: string, data: unknown) => void
 ): Promise<Candidate | null> {
-  // Scrape with Firecrawl
+  const name = extractNameFromSerper(result.title);
+
+  // Scrape
+  send("activity", `Scraping ${name}...`);
   const markdown = await firecrawlLimiter.execute(() => scrapeUrl(result.link));
 
-  // Build raw text for Claude to extract from
   let rawText: string;
   if (markdown) {
     rawText = markdown;
@@ -43,7 +79,8 @@ async function processProfile(
     rawText = `Name from title: ${result.title}\nSnippet: ${result.snippet}\nURL: ${result.link}`;
   }
 
-  // Claude structured extraction
+  // Extract
+  send("activity", `Extracting profile for ${name}...`);
   const extractionResponse = await claudeLimiter.execute(() =>
     withRetry(
       () => generateText(STRUCTURED_EXTRACTOR_SYSTEM, rawText, 1024),
@@ -98,7 +135,8 @@ async function processProfile(
     structured.is_open_to_work ||
     detectOpenToWork(structured.current_role || null, markdown);
 
-  // Rank with Claude
+  // Rank
+  send("activity", `Analyzing fit for ${structured.full_name || name}...`);
   const profileSummary = [
     `Name: ${structured.full_name}`,
     `Current Role: ${structured.current_role || "N/A"}`,
@@ -155,6 +193,7 @@ async function processProfile(
     career_highlights: structured.career_highlights || [],
   };
 
+  // Upsert
   const { data: saved, error: upsertError } = await supabase
     .from("candidates")
     .upsert(
@@ -194,7 +233,7 @@ export async function POST(request: NextRequest) {
       };
 
       try {
-        // ── Phase 1 (5-15%): Generate queries ──
+        // ── Phase 1: Generate queries ──
         send("progress", {
           phase: "generating",
           detail: "Generating search queries...",
@@ -204,7 +243,6 @@ export async function POST(request: NextRequest) {
 
         let dorks: string[] = [];
 
-        // Try multi-dork generation first
         try {
           const multiDorkResponse = await withRetry(() =>
             generateText(MULTI_DORK_GENERATOR_SYSTEM, query, 512)
@@ -224,7 +262,6 @@ export async function POST(request: NextRequest) {
           dorks = [singleDork.trim()];
         }
 
-        // Optional: cross-platform queries for Wide Net mode
         let allQueries = [...dorks];
         if (wideNet) {
           const crossPlatform = generateCrossPlatformQueries(query);
@@ -232,7 +269,7 @@ export async function POST(request: NextRequest) {
         }
 
         send("queries", allQueries);
-        send("dork", dorks[0]); // primary dork for backward compat
+        send("dork", dorks[0]);
         send("progress", {
           phase: "generating",
           detail: `Generated ${allQueries.length} search queries`,
@@ -240,7 +277,7 @@ export async function POST(request: NextRequest) {
           counts: { queries: allQueries.length },
         });
 
-        // ── Phase 2 (15-40%): Execute all queries with multi-page pagination ──
+        // ── Phase 2: Parallel search + immediate snippet candidates ──
         send("progress", {
           phase: "searching",
           detail: "Searching across all queries...",
@@ -248,19 +285,30 @@ export async function POST(request: NextRequest) {
           counts: { queries: allQueries.length },
         });
 
-        const pagesToFetch = offset > 0 ? 1 : maxPages;
-        const startPage = offset > 0 ? Math.floor(offset / 10) + 1 : 1;
+        // Initialize Supabase early for cache checks
+        let supabase;
+        try {
+          supabase = createServerClient();
+        } catch {
+          send("error", {
+            message: "Supabase not configured. Set your env vars in .env.local",
+          });
+          send("done", { count: 0, hasMore: false, nextOffset: 0 });
+          controller.close();
+          return;
+        }
 
+        const pagesToFetch = offset > 0 ? 1 : maxPages;
+
+        // Fire all search queries in parallel
         const allResults: SerperResult[] = [];
         await Promise.all(
           allQueries.map(async (q) => {
             try {
-              let results: SerperResult[];
-              if (pagesToFetch > 1 && offset === 0) {
-                results = await searchGoogleMultiPage(q, pagesToFetch, 10);
-              } else {
-                results = await searchGoogle(q, 10);
-              }
+              const results =
+                pagesToFetch > 1 && offset === 0
+                  ? await searchGoogleMultiPage(q, pagesToFetch, 10)
+                  : await searchGoogle(q, 10);
               allResults.push(...results);
             } catch (err) {
               console.error(`Query failed: ${q}`, err);
@@ -271,77 +319,57 @@ export async function POST(request: NextRequest) {
         send("progress", {
           phase: "searching",
           detail: `Found ${allResults.length} raw results`,
-          progress: 40,
+          progress: 35,
           counts: { queries: allQueries.length, rawResults: allResults.length },
         });
 
-        // ── Phase 3 (40-55%): Deduplicate + previews + cache check ──
-        send("progress", {
-          phase: "deduplicating",
-          detail: "Deduplicating results...",
-          progress: 42,
-          counts: { rawResults: allResults.length },
-        });
-
+        // ── Phase 3: Deduplicate + snippet candidates + cache ──
+        send("activity", `Deduplicating ${allResults.length} results...`);
         const deduplicated = deduplicateResults(allResults);
-        const linkedinResults = deduplicated.filter(
+        const profileResults = deduplicated.filter(
           (r) =>
             r.link.includes("linkedin.com/in/") ||
             r.source === "github" ||
             r.source === "stackoverflow"
         );
 
-        if (linkedinResults.length === 0) {
+        if (profileResults.length === 0) {
           send("status", "No profiles found. Try a different query.");
           send("done", { count: 0, hasMore: false, nextOffset: 0 });
           controller.close();
           return;
         }
 
+        send("progress", {
+          phase: "deduplicating",
+          detail: `${profileResults.length} unique profiles`,
+          progress: 40,
+          counts: {
+            rawResults: allResults.length,
+            uniqueResults: profileResults.length,
+          },
+        });
+
         // Send preview cards immediately
-        for (const r of linkedinResults) {
+        for (const r of profileResults) {
           send("preview", {
-            id: `preview-${Buffer.from(r.link).toString("base64").slice(0, 12)}`,
-            name: r.title
-              .replace(/\s*[-–|·]\s*(LinkedIn|GitHub|Stack Overflow).*$/i, "")
-              .trim(),
+            id: `preview-${Buffer.from(r.link).toString("base64url")}`,
+            name: extractNameFromSerper(r.title),
             snippet: r.snippet,
             url: r.link,
             source: r.source,
           });
         }
 
-        send("progress", {
-          phase: "deduplicating",
-          detail: `${linkedinResults.length} unique profiles`,
-          progress: 50,
-          counts: {
-            rawResults: allResults.length,
-            uniqueResults: linkedinResults.length,
-          },
-        });
-
-        // Check Supabase for cached candidates
-        let supabase;
-        try {
-          supabase = createServerClient();
-        } catch {
-          send("error", {
-            message:
-              "Supabase not configured. Set your env vars in .env.local",
-          });
-          send("done", { count: 0, hasMore: false, nextOffset: 0 });
-          controller.close();
-          return;
-        }
-
-        const profileUrls = linkedinResults.map((r) => r.link);
+        // Check Supabase cache
+        const profileUrls = profileResults.map((r) => r.link);
         const { cached: cachedUrls, toProcess } =
           await filterExistingCandidates(supabase as never, profileUrls);
 
         // Send cached candidates instantly
         let processedCount = 0;
         if (cachedUrls.length > 0) {
+          send("activity", `Loading ${cachedUrls.length} cached candidates...`);
           const { data: cachedCandidates } = await supabase
             .from("candidates")
             .select("*")
@@ -358,68 +386,72 @@ export async function POST(request: NextRequest) {
         send("progress", {
           phase: "deduplicating",
           detail: `${cachedUrls.length} cached, ${toProcess.length} to enrich`,
-          progress: 55,
+          progress: 50,
           counts: {
             rawResults: allResults.length,
-            uniqueResults: linkedinResults.length,
+            uniqueResults: profileResults.length,
             cached: cachedUrls.length,
           },
         });
 
-        // Save search history
-        const { error: historyError } = await supabase
+        // Save search history (non-blocking)
+        supabase
           .from("search_history")
           .insert({
             natural_language_query: query,
             generated_dork: dorks[0],
-            result_count: linkedinResults.length,
+            result_count: profileResults.length,
             query_count: allQueries.length,
             wide_net: wideNet,
             pages_fetched: pagesToFetch,
+          })
+          .then(({ error }) => {
+            if (error) console.error("Failed to save search history:", error);
           });
-        if (historyError) {
-          console.error("Failed to save search history:", historyError);
-        }
 
-        // ── Phase 4 (55-95%): Enrich new profiles in batches of 3 ──
-        const toEnrich = linkedinResults.filter((r) =>
+        // ── Phase 4: Enrich new profiles in batches of 5 ──
+        const toEnrich = profileResults.filter((r) =>
           toProcess.includes(r.link)
         );
 
         if (toEnrich.length > 0) {
           resetFirecrawlFailures();
+          const BATCH_SIZE = 5;
 
-          for (let i = 0; i < toEnrich.length; i += 3) {
-            const batch = toEnrich.slice(i, i + 3);
+          for (let i = 0; i < toEnrich.length; i += BATCH_SIZE) {
+            const batch = toEnrich.slice(i, i + BATCH_SIZE);
             const batchProgress =
-              55 + Math.round(((i + batch.length) / toEnrich.length) * 40);
+              50 + Math.round(((i + batch.length) / toEnrich.length) * 45);
 
             send("progress", {
               phase: "enriching",
-              detail: `Enriching profiles ${i + 1}-${Math.min(i + 3, toEnrich.length)} of ${toEnrich.length}...`,
+              detail: `Enriching ${i + 1}-${Math.min(i + BATCH_SIZE, toEnrich.length)} of ${toEnrich.length}...`,
               progress: Math.min(batchProgress, 95),
               counts: {
                 rawResults: allResults.length,
-                uniqueResults: linkedinResults.length,
+                uniqueResults: profileResults.length,
                 cached: cachedUrls.length,
                 enriched: processedCount,
               },
             });
 
+            // Process entire batch in parallel
             const results = await Promise.all(
               batch.map(async (result) => {
                 try {
-                  return await processProfile(result, query, supabase);
+                  const candidate = await enrichProfile(result, query, supabase, send);
+                  return candidate;
                 } catch (error) {
                   console.error(`Error processing ${result.link}:`, error);
                   send("error", {
-                    message: `Failed to process ${result.link}`,
+                    message: `Failed to process ${extractNameFromSerper(result.title)}`,
                   });
                   return null;
                 }
               })
             );
 
+            // Stream each candidate as it completes
             for (const candidate of results) {
               if (candidate) {
                 processedCount++;
@@ -429,9 +461,9 @@ export async function POST(request: NextRequest) {
           }
         }
 
-        // ── Phase 5 (100%): Done ──
-        const hasMore = linkedinResults.length >= maxPages * 10;
-        const nextOffset = offset + linkedinResults.length;
+        // ── Phase 5: Done ──
+        const hasMore = profileResults.length >= maxPages * 10;
+        const nextOffset = offset + profileResults.length;
 
         send("progress", {
           phase: "complete",
@@ -439,7 +471,7 @@ export async function POST(request: NextRequest) {
           progress: 100,
           counts: {
             rawResults: allResults.length,
-            uniqueResults: linkedinResults.length,
+            uniqueResults: profileResults.length,
             cached: cachedUrls.length,
             enriched: processedCount,
           },

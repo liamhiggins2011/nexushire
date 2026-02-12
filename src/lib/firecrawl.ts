@@ -29,6 +29,14 @@ export async function scrapeUrl(url: string): Promise<string | null> {
     body: JSON.stringify({
       url,
       formats: ["markdown"],
+      excludeTags: [
+        "img", "svg", "picture", "video", "iframe",
+        "style", "link[rel=stylesheet]",
+        "nav", "footer", "header",
+        "script", "noscript",
+      ],
+      waitFor: 0,
+      timeout: 15000,
     }),
   });
 
