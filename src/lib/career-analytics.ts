@@ -179,3 +179,94 @@ export function getAllCompanies(experience: Experience[]): string[] {
   }
   return Array.from(companies);
 }
+
+/**
+ * Detect if a candidate is likely to move based on vesting cycles.
+ * Common vesting schedules: 4-year cliff (equity), 2-year review cycles.
+ * Returns a label if the candidate's current role tenure is near these milestones.
+ */
+export function detectInferredIntent(experience: Experience[]): {
+  label: string | null;
+  confidence: "high" | "medium" | "low" | null;
+  currentTenureMonths: number;
+} {
+  if (experience.length === 0) {
+    return { label: null, confidence: null, currentTenureMonths: 0 };
+  }
+
+  // Find current role (first in experience list, typically most recent)
+  const current = experience[0];
+  let months = current.months || 0;
+
+  // Try to compute from dates if months is 0
+  if (months === 0 && current.start_date) {
+    const start = new Date(current.start_date);
+    if (!isNaN(start.getTime())) {
+      const end = current.end_date ? new Date(current.end_date) : new Date();
+      if (!isNaN(end.getTime())) {
+        months = Math.max(
+          1,
+          Math.round((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24 * 30))
+        );
+      }
+    }
+  }
+
+  if (months === 0 && current.duration) {
+    months = parseMonthsFromDuration(current.duration);
+  }
+
+  if (months === 0) {
+    return { label: null, confidence: null, currentTenureMonths: 0 };
+  }
+
+  // Check vesting cycle windows (±3 months around milestones)
+  const WINDOW = 3;
+
+  // 4-year cliff (48 months) — full equity vest, highest signal
+  if (months >= 45 && months <= 54) {
+    return {
+      label: "4yr vest cliff",
+      confidence: "high",
+      currentTenureMonths: months,
+    };
+  }
+
+  // 2-year mark (24 months) — common review/promotion cycle
+  if (months >= 21 && months <= 27) {
+    return {
+      label: "2yr cycle",
+      confidence: "medium",
+      currentTenureMonths: months,
+    };
+  }
+
+  // 3-year mark (36 months) — mid-vest, growing restlessness
+  if (months >= 33 && months <= 39) {
+    return {
+      label: "3yr mark",
+      confidence: "medium",
+      currentTenureMonths: months,
+    };
+  }
+
+  // 1-year mark (12 months) — past probation, open to exploring
+  if (months >= 11 && months <= 15) {
+    return {
+      label: "1yr mark",
+      confidence: "low",
+      currentTenureMonths: months,
+    };
+  }
+
+  // 5+ years — likely fully vested, may be looking
+  if (months >= 57) {
+    return {
+      label: "Fully vested",
+      confidence: "medium",
+      currentTenureMonths: months,
+    };
+  }
+
+  return { label: null, confidence: null, currentTenureMonths: months };
+}

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createServerClient } from "@/lib/supabase/server";
-import { generateText } from "@/lib/anthropic";
+import { generateText } from "@/lib/llm";
 import { OUTREACH_WRITER_SYSTEM } from "@/lib/prompts/outreach-writer";
 
 export async function POST(

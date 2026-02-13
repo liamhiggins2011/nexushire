@@ -15,7 +15,7 @@ import { CandidateDetail } from "@/components/candidate/candidate-detail";
 import { Header } from "@/components/layout/header";
 import { Button } from "@/components/ui/button";
 import { Candidate, SearchFilters } from "@/types";
-import { LayoutList, Map, ChevronDown } from "lucide-react";
+import { LayoutList, Map, FilterX, Loader2 } from "lucide-react";
 
 const SENIORITY_KEYWORDS: Record<string, string[]> = {
   junior: ["junior", "associate", "entry", "intern", "graduate"],
@@ -40,6 +40,7 @@ export default function HomePage() {
     search,
     loadMore,
     cancel,
+    updateCandidate,
   } = useSearch();
   const { shortlist, addToShortlist, setSelectedCandidate } = useSearchStore();
 
@@ -123,6 +124,40 @@ export default function HomePage() {
         const title = (c.current_title || c.headline || "").toLowerCase();
         if (!keywords.some((kw) => title.includes(kw))) return false;
       }
+      // Security Clearance
+      if (filters.securityClearance !== "any") {
+        const searchText = `${c.headline || ""} ${c.current_title || ""} ${c.career_narrative || ""}`.toLowerCase();
+        const clearancePatterns: Record<string, string[]> = {
+          ts_sci: ["ts/sci", "top secret/sci", "ts sci"],
+          ts: ["top secret", "ts/sci", "ts "],
+          secret: ["secret", "clearance"],
+          public_trust: ["public trust"],
+        };
+        const patterns = clearancePatterns[filters.securityClearance] || [];
+        if (!patterns.some((p) => searchText.includes(p))) return false;
+      }
+      // Likely to Move — short tenure at current job + open to work signals
+      if (filters.likelyToMove === true) {
+        const isLikely = c.is_open_to_work ||
+          (c.avg_tenure != null && c.avg_tenure > 0 && c.avg_tenure < 2) ||
+          /open to|seeking|looking for/i.test(c.headline || "");
+        if (!isLikely) return false;
+      }
+      // Diversity Signals — HBCU/HSI schools in education
+      if (filters.diversitySignals === true) {
+        const eduText = c.education
+          ?.map((e) => `${e.school} ${e.field || ""}`)
+          .join(" ")
+          .toLowerCase() || "";
+        const orgText = `${c.headline || ""} ${c.career_narrative || ""}`.toLowerCase();
+        const diversityKeywords = [
+          "hbcu", "howard", "spelman", "morehouse", "hampton", "fisk", "tuskegee",
+          "florida a&m", "north carolina a&t", "prairie view", "grambling",
+          "hispanic", "hsi", "society of women engineers", "nsbe", "shpe",
+          "diversity", "dei", "inclusion", "underrepresented",
+        ];
+        if (!diversityKeywords.some((kw) => eduText.includes(kw) || orgText.includes(kw))) return false;
+      }
       return true;
     });
   }, [candidates, filters]);
@@ -130,6 +165,7 @@ export default function HomePage() {
   const handleSearch = useCallback(
     (query: string, options?: { wideNet?: boolean }) => {
       lastQueryRef.current = { query, wideNet: options?.wideNet };
+      setFilters(DEFAULT_FILTERS); // Reset filters on new search
       search(query, options);
     },
     [search]
@@ -175,6 +211,31 @@ export default function HomePage() {
     setSelectedIds(new Set());
   }, [filteredCandidates, selectedIds, addToShortlist]);
 
+  // Infinite scroll via IntersectionObserver
+  const loadMoreSentinelRef = useRef<HTMLDivElement | null>(null);
+  const observerRef = useRef<IntersectionObserver | null>(null);
+
+  useEffect(() => {
+    observerRef.current?.disconnect();
+
+    if (!hasMore || isSearching) return;
+
+    observerRef.current = new IntersectionObserver(
+      (entries) => {
+        if (entries[0]?.isIntersecting && hasMore && !isSearching) {
+          handleLoadMore();
+        }
+      },
+      { rootMargin: "200px" }
+    );
+
+    if (loadMoreSentinelRef.current) {
+      observerRef.current.observe(loadMoreSentinelRef.current);
+    }
+
+    return () => observerRef.current?.disconnect();
+  }, [hasMore, isSearching, handleLoadMore]);
+
   const handleBulkExport = useCallback(async () => {
     const selected = filteredCandidates.filter((c) => selectedIds.has(c.id));
     const ids = selected.map((c) => c.id).join(",");
@@ -195,7 +256,7 @@ export default function HomePage() {
       <Header />
       <div className="flex">
         {/* Always-visible filter sidebar */}
-        <aside className="border-r bg-card">
+        <aside className="border-r border-border/40 bg-card/50 backdrop-blur-sm">
           <FilterSidebar
             filters={filters}
             onFiltersChange={setFilters}
@@ -268,6 +329,24 @@ export default function HomePage() {
               </div>
             )}
 
+            {/* Filters hiding results warning */}
+            {!isSearching && candidates.length > 0 && filteredCandidates.length === 0 && (
+              <div className="flex items-center justify-between gap-3 p-4 rounded-lg border border-amber-200 bg-amber-50 dark:border-amber-800 dark:bg-amber-950/30">
+                <div className="flex items-center gap-2 text-sm text-amber-700 dark:text-amber-400">
+                  <FilterX className="h-4 w-4 shrink-0" />
+                  <span>Your filters are hiding all {candidates.length} candidates. Adjust or reset filters to see results.</span>
+                </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setFilters(DEFAULT_FILTERS)}
+                  className="shrink-0"
+                >
+                  Reset Filters
+                </Button>
+              </div>
+            )}
+
             {viewMode === "list" ? (
               <SearchResults
                 candidates={filteredCandidates}
@@ -278,6 +357,7 @@ export default function HomePage() {
                 shortlistedIds={shortlistedIds}
                 onAddToShortlist={handleAddToShortlist}
                 onViewDetail={handleViewDetail}
+                onEnriched={updateCandidate}
                 selectedIds={selectedIds}
                 onSelectCandidate={handleSelectCandidate}
                 onSelectAll={handleSelectAll}
@@ -292,17 +372,20 @@ export default function HomePage() {
               />
             )}
 
-            {/* Load More button */}
-            {hasMore && !isSearching && (
-              <div className="flex justify-center mt-6">
-                <Button
-                  variant="outline"
-                  onClick={handleLoadMore}
-                  className="gap-2"
-                >
-                  <ChevronDown className="h-4 w-4" />
-                  Load More Candidates
-                </Button>
+            {/* Infinite scroll sentinel */}
+            {hasMore && (
+              <div
+                ref={loadMoreSentinelRef}
+                className="flex justify-center py-8"
+              >
+                {isSearching ? (
+                  <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Loading more candidates...
+                  </div>
+                ) : (
+                  <div className="h-1" />
+                )}
               </div>
             )}
           </div>

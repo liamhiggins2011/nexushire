@@ -18,18 +18,19 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
-import { ArrowLeft, MapPin, Building2, ExternalLink } from "lucide-react";
+import { ArrowLeft, MapPin, Building2, ExternalLink, LayoutList, Kanban } from "lucide-react";
 import Link from "next/link";
 import { Project, ProjectCandidate, CandidateStatus } from "@/types";
+import { KanbanBoard } from "@/components/pipeline/kanban-board";
 import { toast } from "sonner";
 
 const STATUS_COLORS: Record<CandidateStatus, string> = {
-  new: "bg-gray-100 text-gray-800",
-  contacted: "bg-blue-100 text-blue-800",
-  replied: "bg-green-100 text-green-800",
-  interview: "bg-purple-100 text-purple-800",
-  rejected: "bg-red-100 text-red-800",
-  hired: "bg-emerald-100 text-emerald-800",
+  new: "bg-gray-100 text-gray-800 dark:bg-gray-800 dark:text-gray-300",
+  contacted: "bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400",
+  replied: "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400",
+  interview: "bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-400",
+  rejected: "bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400",
+  hired: "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-400",
 };
 
 export default function ProjectDetailPage({
@@ -41,6 +42,7 @@ export default function ProjectDetailPage({
   const [project, setProject] = useState<Project | null>(null);
   const [candidates, setCandidates] = useState<ProjectCandidate[]>([]);
   const [loading, setLoading] = useState(true);
+  const [viewMode, setViewMode] = useState<"board" | "list">("board");
 
   useEffect(() => {
     async function load() {
@@ -65,6 +67,15 @@ export default function ProjectDetailPage({
     candidateId: string,
     newStatus: CandidateStatus
   ) {
+    // Optimistic update
+    setCandidates((prev) =>
+      prev.map((pc) =>
+        pc.candidate_id === candidateId
+          ? { ...pc, status: newStatus }
+          : pc
+      )
+    );
+
     try {
       const res = await fetch(`/api/projects/${id}/candidates`, {
         method: "PATCH",
@@ -74,17 +85,17 @@ export default function ProjectDetailPage({
           status: newStatus,
         }),
       });
-      if (res.ok) {
-        setCandidates(
-          candidates.map((pc) =>
-            pc.candidate_id === candidateId
-              ? { ...pc, status: newStatus }
-              : pc
-          )
-        );
-        toast.success("Status updated");
-      }
+      if (!res.ok) throw new Error("Update failed");
+      toast.success("Status updated");
     } catch {
+      // Revert on failure
+      setCandidates((prev) =>
+        prev.map((pc) =>
+          pc.candidate_id === candidateId
+            ? { ...pc, status: pc.status }
+            : pc
+        )
+      );
       toast.error("Failed to update status");
     }
   }
@@ -93,12 +104,12 @@ export default function ProjectDetailPage({
     return (
       <div className="min-h-screen bg-background">
         <Header />
-        <main className="container mx-auto px-4 py-8 max-w-5xl">
+        <main className="container mx-auto px-4 py-8 max-w-6xl">
           <Skeleton className="h-8 w-64 mb-4" />
           <Skeleton className="h-4 w-96 mb-8" />
-          <div className="space-y-4">
-            {Array.from({ length: 3 }).map((_, i) => (
-              <Skeleton key={i} className="h-24 w-full" />
+          <div className="flex gap-3">
+            {Array.from({ length: 5 }).map((_, i) => (
+              <Skeleton key={i} className="h-64 flex-1" />
             ))}
           </div>
         </main>
@@ -110,7 +121,7 @@ export default function ProjectDetailPage({
     return (
       <div className="min-h-screen bg-background">
         <Header />
-        <main className="container mx-auto px-4 py-8 max-w-5xl text-center">
+        <main className="container mx-auto px-4 py-8 max-w-6xl text-center">
           <p>Project not found.</p>
           <Button asChild className="mt-4">
             <Link href="/projects">Back to Projects</Link>
@@ -123,7 +134,7 @@ export default function ProjectDetailPage({
   return (
     <div className="min-h-screen bg-background">
       <Header />
-      <main className="container mx-auto px-4 py-8 max-w-5xl">
+      <main className="container mx-auto px-4 py-8 max-w-6xl">
         <Button variant="ghost" size="sm" asChild className="mb-4">
           <Link href="/projects">
             <ArrowLeft className="mr-2 h-4 w-4" />
@@ -131,14 +142,34 @@ export default function ProjectDetailPage({
           </Link>
         </Button>
 
-        <div className="mb-6">
-          <h1 className="text-2xl font-bold">{project.name}</h1>
-          {project.description && (
-            <p className="text-muted-foreground mt-1">{project.description}</p>
-          )}
-          <p className="text-sm text-muted-foreground mt-2">
-            {candidates.length} candidate{candidates.length !== 1 ? "s" : ""}
-          </p>
+        <div className="flex items-start justify-between mb-6">
+          <div>
+            <h1 className="text-2xl font-bold">{project.name}</h1>
+            {project.description && (
+              <p className="text-muted-foreground mt-1">{project.description}</p>
+            )}
+            <p className="text-sm text-muted-foreground mt-2">
+              {candidates.length} candidate{candidates.length !== 1 ? "s" : ""}
+            </p>
+          </div>
+          <div className="flex items-center gap-1">
+            <Button
+              variant={viewMode === "board" ? "default" : "outline"}
+              size="sm"
+              onClick={() => setViewMode("board")}
+            >
+              <Kanban className="h-4 w-4 mr-1.5" />
+              Board
+            </Button>
+            <Button
+              variant={viewMode === "list" ? "default" : "outline"}
+              size="sm"
+              onClick={() => setViewMode("list")}
+            >
+              <LayoutList className="h-4 w-4 mr-1.5" />
+              List
+            </Button>
+          </div>
         </div>
 
         {candidates.length === 0 ? (
@@ -146,6 +177,11 @@ export default function ProjectDetailPage({
             <p className="text-lg font-medium">No candidates yet</p>
             <p>Search for candidates and add them to this project.</p>
           </div>
+        ) : viewMode === "board" ? (
+          <KanbanBoard
+            candidates={candidates}
+            onStatusChange={handleStatusChange}
+          />
         ) : (
           <div className="space-y-3">
             {candidates.map((pc) => {
@@ -176,7 +212,7 @@ export default function ProjectDetailPage({
                         </div>
                       </div>
                       <div className="flex items-center gap-2 shrink-0">
-                        {c.fit_score && (
+                        {c.fit_score != null && c.fit_score > 0 && (
                           <Badge variant="outline" className="font-bold">
                             {c.fit_score}
                           </Badge>

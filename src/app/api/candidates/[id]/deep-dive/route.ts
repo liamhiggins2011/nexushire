@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createServerClient } from "@/lib/supabase/server";
-import { generateText } from "@/lib/anthropic";
+import { generateText } from "@/lib/llm";
 import { searchGoogle } from "@/lib/serper";
 
 const DEEP_DIVE_SYSTEM = `You are an expert talent researcher. Given aggregated data about a candidate from LinkedIn, GitHub, and Twitter/X, generate a comprehensive talent intelligence report.

@@ -76,7 +76,7 @@ export function useSearch() {
           body: JSON.stringify({
             query,
             wideNet: options?.wideNet ?? false,
-            maxPages: options?.maxPages ?? 3,
+            maxPages: options?.maxPages ?? 5,
             offset: options?.offset ?? 0,
           }),
           signal: controller.signal,
@@ -261,5 +261,14 @@ export function useSearch() {
     }));
   }, []);
 
-  return { ...state, search, loadMore, cancel };
+  const updateCandidate = useCallback((updated: Candidate) => {
+    setState((prev) => ({
+      ...prev,
+      candidates: prev.candidates.map((c) =>
+        c.id === updated.id ? updated : c
+      ),
+    }));
+  }, []);
+
+  return { ...state, search, loadMore, cancel, updateCandidate };
 }

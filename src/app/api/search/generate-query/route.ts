@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { generateText } from "@/lib/anthropic";
+import { generateText } from "@/lib/llm";
 import { DORK_GENERATOR_SYSTEM } from "@/lib/prompts/dork-generator";
 
 export async function POST(request: NextRequest) {

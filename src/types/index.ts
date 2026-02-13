@@ -25,6 +25,8 @@ export interface Candidate {
   tech_stack: string[] | null;
   career_highlights: string[] | null;
   career_narrative: string | null;
+  inferred_intent: string | null;
+  intent_confidence: "high" | "medium" | "low" | null;
   deep_dive_data: DeepDiveData | null;
   created_at: string;
   updated_at: string;
@@ -169,6 +171,8 @@ export interface EnterpriseSearchRequest {
 
 export type CompanyPedigreeFilter = "faang" | "unicorn" | "yc" | "all";
 
+export type SecurityClearance = "any" | "ts_sci" | "ts" | "secret" | "public_trust";
+
 export interface SearchFilters {
   minYoe: number;
   maxYoe: number;
@@ -182,4 +186,7 @@ export interface SearchFilters {
   seniority?: string;
   title?: string;
   minFitScore: number;
+  securityClearance: SecurityClearance;
+  likelyToMove: boolean | null;
+  diversitySignals: boolean | null;
 }

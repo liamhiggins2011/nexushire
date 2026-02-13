@@ -27,6 +27,9 @@ import {
   Briefcase,
   Star,
   X,
+  Lock,
+  UserCheck,
+  Heart,
 } from "lucide-react";
 
 interface FilterSidebarProps {
@@ -50,6 +53,9 @@ const DEFAULT_FILTERS: SearchFilters = {
   seniority: "all",
   title: "",
   minFitScore: 0,
+  securityClearance: "any",
+  likelyToMove: null,
+  diversitySignals: null,
 };
 
 export { DEFAULT_FILTERS };
@@ -87,9 +93,13 @@ export function FilterSidebar({
     for (const c of candidates) {
       const title = c.current_title || c.headline;
       if (title) {
-        // Normalize: take the main part before pipes/dashes
-        const clean = title.split(/\s*[|·]\s*/)[0].trim();
-        if (clean) t.set(clean, (t.get(clean) || 0) + 1);
+        // Normalize: take the main role part, strip tech lists and company names
+        let clean = title.split(/\s*[|·]\s*/)[0].trim();
+        // Remove trailing " - Tech, Tech" or " - Company" parts
+        clean = clean.replace(/\s*-\s*(?:Python|Java|React|Node|AWS|Docker|Django|TypeScript|JavaScript|Go|Rust|PHP|Ruby|Swift|Kotlin|Terraform)[\s,].*$/i, "").trim();
+        // Cap length
+        if (clean.length > 40) clean = clean.slice(0, 40);
+        if (clean.length > 3) t.set(clean, (t.get(clean) || 0) + 1);
       }
     }
     return Array.from(t.entries())
@@ -120,7 +130,7 @@ export function FilterSidebar({
   }, [candidates]);
 
   return (
-    <div className="w-60 shrink-0 space-y-4 p-4 border rounded-lg bg-card h-fit sticky top-4">
+    <div className="w-60 shrink-0 space-y-4 p-4 border border-border/50 rounded-lg bg-card/80 backdrop-blur-sm dark:bg-card/40 dark:border-border/30 h-fit sticky top-4">
       <div className="flex items-center justify-between">
         <h3 className="text-sm font-semibold flex items-center gap-1.5">
           <Filter className="h-4 w-4" />
@@ -425,6 +435,61 @@ export function FilterSidebar({
             <SelectItem value="director">Director+</SelectItem>
           </SelectContent>
         </Select>
+      </div>
+
+      <Separator />
+
+      {/* Security Clearance */}
+      <div className="space-y-1.5">
+        <label className="text-xs font-medium flex items-center gap-1.5">
+          <Lock className="h-3.5 w-3.5" />
+          Security Clearance
+        </label>
+        <Select
+          value={filters.securityClearance}
+          onValueChange={(val) => update({ securityClearance: val as SearchFilters["securityClearance"] })}
+        >
+          <SelectTrigger className="h-8 text-xs">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="any">Any</SelectItem>
+            <SelectItem value="ts_sci">TS/SCI</SelectItem>
+            <SelectItem value="ts">Top Secret</SelectItem>
+            <SelectItem value="secret">Secret</SelectItem>
+            <SelectItem value="public_trust">Public Trust</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+
+      {/* Likely to Move */}
+      <div className="flex items-center gap-2">
+        <Checkbox
+          id="likely-to-move"
+          checked={filters.likelyToMove === true}
+          onCheckedChange={(checked) =>
+            update({ likelyToMove: checked ? true : null })
+          }
+        />
+        <label htmlFor="likely-to-move" className="text-xs font-medium cursor-pointer flex items-center gap-1">
+          <UserCheck className="h-3.5 w-3.5" />
+          Likely to Move
+        </label>
+      </div>
+
+      {/* Diversity Signals */}
+      <div className="flex items-center gap-2">
+        <Checkbox
+          id="diversity-signals"
+          checked={filters.diversitySignals === true}
+          onCheckedChange={(checked) =>
+            update({ diversitySignals: checked ? true : null })
+          }
+        />
+        <label htmlFor="diversity-signals" className="text-xs font-medium cursor-pointer flex items-center gap-1">
+          <Heart className="h-3.5 w-3.5" />
+          Diversity Signals (HBCU/HSI)
+        </label>
       </div>
     </div>
   );

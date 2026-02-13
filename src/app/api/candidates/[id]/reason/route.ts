@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createServerClient } from "@/lib/supabase/server";
-import { generateText } from "@/lib/anthropic";
+import { generateText } from "@/lib/llm";
 import { CANDIDATE_RANKER_SYSTEM } from "@/lib/prompts/candidate-ranker";
 
 export async function POST(
