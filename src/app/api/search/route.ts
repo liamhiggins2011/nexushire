@@ -1,10 +1,17 @@
 import { NextRequest } from "next/server";
 import { getLLMConfig } from "@/lib/config";
-import { searchGoogle, searchGoogleMultiPage } from "@/lib/serper";
 import { createServerClient } from "@/lib/supabase/server";
 import { Candidate, SerperResult, StructuredProfile } from "@/types";
 import { deduplicateResults, filterExistingCandidates } from "@/lib/deduplication";
-import { generateCrossPlatformQueries } from "@/lib/query-diversifier";
+import { parseBooleanQuery } from "@/lib/boolean-parser";
+import { createOrchestrator, generateRelaxedDorks } from "@/lib/search-orchestrator";
+import { indexCandidates } from "@/lib/meilisearch";
+import { expandLocation, isLocationMatch } from "@/lib/geo-expansion";
+import { searchGoogleMultiPage } from "@/lib/serper";
+import { parseSnippetExperience, computeTenure } from "@/lib/tenure-engine";
+import { searchApollo, buildApolloSearchParams } from "@/lib/apollo";
+import type { ApolloPersonResult } from "@/types";
+
 
 function encodeSSE(event: string, data: unknown): string {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
@@ -27,16 +34,14 @@ function computeCodeFitScore(
   const queryWords = query.toLowerCase().split(/\s+/).filter((w) => w.length > 2);
   const searchText = `${result.title} ${result.snippet} ${profile.current_role || ""} ${(profile.tech_stack || []).join(" ")}`.toLowerCase();
 
-  let score = 30; // base score for appearing in search results
+  let score = 30;
 
-  // Title/role keyword match (+5 per keyword, max +30)
   let keywordHits = 0;
   for (const word of queryWords) {
     if (searchText.includes(word)) keywordHits++;
   }
   score += Math.min(30, keywordHits * (30 / Math.max(queryWords.length, 1)));
 
-  // Tech stack match (+15 if any query tech found in profile skills)
   const techStack = profile.tech_stack || [];
   if (techStack.length > 0) {
     const techHits = queryWords.filter((w) =>
@@ -45,13 +50,9 @@ function computeCodeFitScore(
     if (techHits.length > 0) score += 15;
   }
 
-  // Experience depth (+10 if has parsed experience)
   if ((profile.experience?.length || 0) > 0) score += 10;
-
-  // YOE bonus (+5 if has meaningful experience)
   if ((profile.total_yoe || 0) > 2) score += 5;
 
-  // Seniority alignment (+10)
   const seniorityTerms = ["senior", "staff", "principal", "lead", "director"];
   const querySeniority = seniorityTerms.find((s) => query.toLowerCase().includes(s));
   if (querySeniority && searchText.includes(querySeniority)) score += 10;
@@ -59,158 +60,7 @@ function computeCodeFitScore(
   return Math.min(100, Math.round(score));
 }
 
-// ─── Rule-based dork generation (instant, no LLM) ───
-
-function generateDorksFromQuery(query: string): string[] {
-  // Detect if user already provided a boolean/dork query (contains AND/OR operators or site: prefix)
-  const isPreformatted = /\b(AND|OR)\b/.test(query) || query.includes("site:");
-  if (isPreformatted) {
-    const hasLinkedin = query.toLowerCase().includes("site:linkedin.com");
-    const dork = hasLinkedin ? query : `site:linkedin.com/in ${query}`;
-    return [dork];
-  }
-
-  const q = query.toLowerCase();
-
-  // Extract components from the natural language query
-  const seniorityWords = ["senior", "staff", "principal", "lead", "director", "vp", "head", "junior", "mid", "intern"];
-  const seniority = seniorityWords.find((s) => q.includes(s));
-
-  const locationMatch = query.match(/\b(?:in|at|from|near)\s+([A-Z][a-zA-Z\s,]+)/i);
-  const location = locationMatch?.[1]?.trim();
-
-  let roleText = query;
-  if (seniority) roleText = roleText.replace(new RegExp(seniority, "i"), "");
-  if (location) roleText = roleText.replace(new RegExp(`(?:in|at|from|near)\\s+${location.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "i"), "");
-  const roleWords = roleText.trim().split(/\s+/).filter((w) => w.length > 2);
-
-  const seniorityStr = seniority ? `"${seniority.charAt(0).toUpperCase() + seniority.slice(1)}"` : "";
-  const locationStr = location ? `"${location}"` : "";
-  const roleStr = roleWords.map((w) => `"${w}"`).join(" ");
-
-  const EXCLUDE = `-"recruiter" -"talent" -"hiring" -intitle:jobs -intitle:intern`;
-
-  // Synonym map for broader matching
-  const techSynonyms: Record<string, string> = {
-    react: '("React" OR "React.js" OR "ReactJS")',
-    python: '("Python" OR "Django" OR "FastAPI" OR "Flask")',
-    javascript: '("JavaScript" OR "TypeScript" OR "Node.js")',
-    typescript: '("TypeScript" OR "JavaScript" OR "Node.js")',
-    ml: '("Machine Learning" OR "ML" OR "Deep Learning" OR "AI")',
-    "machine learning": '("Machine Learning" OR "ML" OR "AI" OR "NLP")',
-    ai: '("AI" OR "Machine Learning" OR "ML" OR "LLM")',
-    frontend: '("Frontend" OR "Front-end" OR "Front End" OR "UI")',
-    backend: '("Backend" OR "Back-end" OR "Back End" OR "Server")',
-    fullstack: '("Full Stack" OR "Full-Stack" OR "Fullstack")',
-    "full stack": '("Full Stack" OR "Full-Stack" OR "Fullstack")',
-    devops: '("DevOps" OR "SRE" OR "Infrastructure" OR "Platform")',
-    data: '("Data Engineer" OR "Data Scientist" OR "Analytics" OR "Data")',
-    ios: '("iOS" OR "Swift" OR "SwiftUI" OR "Mobile")',
-    android: '("Android" OR "Kotlin" OR "Mobile")',
-    mobile: '("Mobile" OR "iOS" OR "Android" OR "React Native")',
-    go: '("Golang" OR "Go Developer" OR "Go Engineer")',
-    golang: '("Golang" OR "Go Developer" OR "Go Engineer")',
-    rust: '("Rust" OR "Systems Programming" OR "Rust Engineer")',
-    java: '("Java" OR "Spring" OR "JVM" OR "Spring Boot")',
-    cloud: '("AWS" OR "GCP" OR "Azure" OR "Cloud")',
-    aws: '("AWS" OR "Amazon Web Services" OR "Cloud")',
-    docker: '("Docker" OR "Kubernetes" OR "Containers")',
-    kubernetes: '("Kubernetes" OR "K8s" OR "Docker" OR "Container")',
-    security: '("Security" OR "Cybersecurity" OR "InfoSec" OR "AppSec")',
-    "c++": '("C++" OR "Systems" OR "Embedded")',
-    ruby: '("Ruby" OR "Rails" OR "Ruby on Rails")',
-    php: '("PHP" OR "Laravel" OR "Symfony")',
-    scala: '("Scala" OR "JVM" OR "Spark")',
-  };
-
-  // Seniority synonyms for query variation
-  const seniorSynonyms: Record<string, string[]> = {
-    senior: ["Senior", "Sr.", "Lead"],
-    staff: ["Staff", "Principal", "Distinguished"],
-    principal: ["Principal", "Staff", "Distinguished"],
-    lead: ["Lead", "Senior", "Tech Lead"],
-    director: ["Director", "VP", "Head of"],
-    junior: ["Junior", "Associate", "Entry"],
-  };
-
-  const dorks: string[] = [];
-
-  // Dork 1: Exact match — title + skills + location
-  dorks.push(
-    `site:linkedin.com/in ${seniorityStr} ${roleStr} ${locationStr} ${EXCLUDE}`.replace(/\s+/g, " ").trim()
-  );
-
-  // Dork 2: Skill-focused with synonyms
-  let skillVariant = `site:linkedin.com/in`;
-  for (const word of roleWords) {
-    const synonym = techSynonyms[word.toLowerCase()];
-    skillVariant += synonym ? ` ${synonym}` : ` "${word}"`;
-  }
-  if (seniorityStr) skillVariant += ` ${seniorityStr}`;
-  if (locationStr) skillVariant += ` ${locationStr}`;
-  skillVariant += ` ${EXCLUDE}`;
-  dorks.push(skillVariant.replace(/\s+/g, " ").trim());
-
-  // Dork 3: Title-focused with role synonyms
-  const titleRoles = '("engineer" OR "developer" OR "architect" OR "specialist")';
-  dorks.push(
-    `site:linkedin.com/in ${seniorityStr} ${titleRoles} ${roleStr} ${locationStr} ${EXCLUDE}`.replace(/\s+/g, " ").trim()
-  );
-
-  // Dork 4: Seniority-expanded (try alternate seniority labels)
-  if (seniority && seniorSynonyms[seniority]) {
-    const altSeniority = seniorSynonyms[seniority]
-      .map((s) => `"${s}"`)
-      .join(" OR ");
-    dorks.push(
-      `site:linkedin.com/in (${altSeniority}) ${roleStr} ${locationStr} ${EXCLUDE}`.replace(/\s+/g, " ").trim()
-    );
-  }
-
-  // Dork 5: Broad — drop seniority, keep skills + location (catches more profiles)
-  if (seniorityStr) {
-    dorks.push(
-      `site:linkedin.com/in ${roleStr} ${locationStr} ${EXCLUDE}`.replace(/\s+/g, " ").trim()
-    );
-  }
-
-  // Dork 6: Company-focused variant — target top companies
-  if (roleWords.length > 0) {
-    const topCompanies = '("Google" OR "Meta" OR "Amazon" OR "Apple" OR "Microsoft" OR "Netflix" OR "Stripe" OR "Airbnb")';
-    dorks.push(
-      `site:linkedin.com/in ${roleStr} ${topCompanies} ${EXCLUDE}`.replace(/\s+/g, " ").trim()
-    );
-  }
-
-  // Deduplicate and return up to 6 unique dorks
-  return [...new Set(dorks)].slice(0, 6);
-}
-
-// Generate a relaxed (broader) version of the query for auto-retry on 0 results
-function generateRelaxedDorks(query: string): string[] {
-  // Strip seniority
-  const seniorityWords = ["senior", "staff", "principal", "lead", "director", "vp", "head", "junior", "mid", "intern"];
-  let relaxed = query;
-  for (const s of seniorityWords) {
-    relaxed = relaxed.replace(new RegExp(`\\b${s}\\b`, "gi"), "");
-  }
-  // Strip location
-  relaxed = relaxed.replace(/\b(?:in|at|from|near)\s+[A-Z][a-zA-Z\s,]+/i, "");
-  const words = relaxed.trim().split(/\s+/).filter((w) => w.length > 2);
-
-  if (words.length === 0) {
-    // Extreme fallback — just use original query unquoted
-    return [`site:linkedin.com/in ${query} -"recruiter"`];
-  }
-
-  const broad = words.map((w) => `"${w}"`).join(" ");
-  return [
-    `site:linkedin.com/in ${broad} -"recruiter" -"talent"`,
-    `site:linkedin.com/in ${words.join(" ")} -"recruiter"`,
-  ];
-}
-
-// ─── Snippet-first: create candidate from Serper data (instant, no scraping) ───
+// ─── Snippet parser ───
 
 function parseSnippet(result: SerperResult): {
   name: string;
@@ -223,8 +73,6 @@ function parseSnippet(result: SerperResult): {
   const cleanTitle = result.title.replace(/\s*[\|·\-–]\s*LinkedIn$/i, "").trim();
   const parts = cleanTitle.split(/\s*[-–·|]\s*/);
 
-  // Extract headline — take only the first part after name that looks like a job title
-  // Ignore parts that look like company names, tech lists, or locations
   const ROLE_KEYWORDS = /engineer|developer|architect|manager|designer|analyst|scientist|director|lead|head|vp|cto|ceo|founder|consultant|specialist|coordinator/i;
   let headline: string | null = null;
   let company: string | null = null;
@@ -235,19 +83,15 @@ function parseSnippet(result: SerperResult): {
     if (!headline && ROLE_KEYWORDS.test(trimmed)) {
       headline = trimmed;
     } else if (!company && !ROLE_KEYWORDS.test(trimmed) && /^[A-Z]/.test(trimmed) && trimmed.length > 2 && trimmed.length < 40) {
-      // Looks like a company name — exclude short tech keywords
       const lower = trimmed.toLowerCase().replace(/[.,]/g, "");
       const SKIP = new Set(["react", "reactjs", "nextjs", "next", "python", "django", "node", "nodejs", "typescript", "javascript", "java", "go", "rust", "php", "ruby", "swift", "kotlin", "scala", "sql", "aws", "gcp", "azure", "docker", "kubernetes", "linux", "full", "stack", "frontend", "backend", "remote", "freelance", "contract"]);
       if (!SKIP.has(lower)) company = trimmed;
     }
   }
-  // Fallback: use first non-name part as headline
   if (!headline && parts.length > 1) {
     headline = parts[1].trim() || null;
   }
 
-  // Extract location from snippet — look for "City, State" or "City, Country" patterns
-  // Must have at least one word that's NOT a tech term on each side of the comma
   const TECH_TERMS = new Set([
     "tensorflow", "pytorch", "javascript", "typescript", "react", "angular", "node",
     "python", "docker", "kubernetes", "redis", "kafka", "jenkins", "elasticsearch",
@@ -270,7 +114,6 @@ function parseSnippet(result: SerperResult): {
     }
   }
 
-  // Extract company from snippet — "at CompanyName" or "@ CompanyName"
   if (!company) {
     const companyMatch = result.snippet.match(
       /(?:\bat\b|@)\s+([A-Z][A-Za-z0-9]+(?:\s[A-Z][A-Za-z0-9]+){0,3})/
@@ -278,7 +121,6 @@ function parseSnippet(result: SerperResult): {
     company = companyMatch?.[1]?.trim() || null;
   }
 
-  // Extract tech skills
   const TECH_KEYWORDS = [
     "javascript", "typescript", "python", "java", "go", "rust", "c++", "c#",
     "ruby", "php", "swift", "kotlin", "scala", "sql",
@@ -304,13 +146,16 @@ async function createFromSnippet(
 ): Promise<Candidate | null> {
   const { name, headline, location, company, skills } = parseSnippet(result);
 
-  // Build a basic structured profile from snippet for scoring
   const snippetProfile: Partial<StructuredProfile> = {
     full_name: name,
     current_role: headline || undefined,
     location: location || undefined,
     tech_stack: skills,
   };
+
+  // Extract experience entries from snippet text (e.g. "Software Engineer. Palantir. Oct 2024 - Present 5 months")
+  const snippetExperience = parseSnippetExperience(result.snippet);
+  const tenure = snippetExperience.length > 0 ? computeTenure(snippetExperience) : null;
 
   const candidateData: Record<string, unknown> = {
     full_name: name,
@@ -323,11 +168,14 @@ async function createFromSnippet(
     tech_stack: skills,
     company_pedigree: [],
     career_highlights: [],
-    total_yoe: 0,
-    avg_tenure: 0,
+    experience: snippetExperience.length > 0 ? snippetExperience : null,
+    total_yoe: tenure?.total_yoe ?? 0,
+    avg_tenure: tenure?.avg_tenure_years ?? 0,
     stability_score: 0,
     growth_velocity: 0,
-    is_open_to_work: /open to work|#opentowork|seeking/i.test(result.snippet),
+    is_open_to_work: /open to work|#opentowork|#openforwork|seeking|actively looking|in transition|between roles|available for hire|exploring opportunities|laid off|on the market/i.test(result.snippet),
+    career_narrative: result.snippet || null,
+    profile_photo_url: result.thumbnailUrl || null,
     updated_at: new Date().toISOString(),
   };
 
@@ -345,6 +193,55 @@ async function createFromSnippet(
   return saved as Candidate;
 }
 
+async function createFromApollo(
+  person: ApolloPersonResult,
+  query: string,
+  supabase: ReturnType<typeof createServerClient>
+): Promise<Candidate | null> {
+  const fullName = `${person.first_name} ${person.last_name}`.trim();
+  const profileUrl = `apollo://${person.id}`;
+  const orgName = person.organization?.name || null;
+  const locationParts = [person.city, person.state, person.country].filter(Boolean);
+  const location = locationParts.join(", ") || null;
+
+  const candidateData: Record<string, unknown> = {
+    full_name: fullName,
+    headline: person.headline || person.title || null,
+    location,
+    current_title: person.title || null,
+    current_company: orgName,
+    profile_url: profileUrl,
+    fit_score: 50,
+    tech_stack: [],
+    company_pedigree: [],
+    career_highlights: [],
+    experience: null,
+    total_yoe: 0,
+    avg_tenure: 0,
+    stability_score: 0,
+    growth_velocity: 0,
+    is_open_to_work: false,
+    career_narrative: person.headline || null,
+    profile_photo_url: person.photo_url || null,
+    enrichment_source: "apollo_search",
+    apollo_id: person.id,
+    updated_at: new Date().toISOString(),
+  };
+
+  const { data: saved, error } = await supabase
+    .from("candidates")
+    .upsert(candidateData, { onConflict: "profile_url" })
+    .select()
+    .single();
+
+  if (error) {
+    console.error(`Apollo upsert failed for ${person.id}:`, error);
+    return null;
+  }
+
+  return saved as Candidate;
+}
+
 // ─── Main search endpoint ───
 
 export async function POST(request: NextRequest) {
@@ -353,6 +250,11 @@ export async function POST(request: NextRequest) {
   const wideNet: boolean = body.wideNet ?? false;
   const maxPages: number = body.maxPages ?? 5;
   const offset: number = body.offset ?? 0;
+  const dorkBatch: number = body.dorkBatch ?? 0;
+  const structuredLocation: string | undefined = body.location;
+  const structuredJobTitle: string | undefined = body.jobTitle;
+  const structuredBooleanQuery: string | undefined = body.booleanQuery;
+  const sources: string[] = body.sources ?? ["linkedin"];
 
   if (!query || typeof query !== "string") {
     return new Response("Query is required", { status: 400 });
@@ -363,48 +265,126 @@ export async function POST(request: NextRequest) {
   const stream = new ReadableStream({
     async start(controller) {
       const encoder = new TextEncoder();
+      let closed = false;
       const send = (event: string, data: unknown) => {
-        controller.enqueue(encoder.encode(encodeSSE(event, data)));
+        if (closed) return;
+        try {
+          controller.enqueue(encoder.encode(encodeSSE(event, data)));
+        } catch {
+          closed = true;
+        }
+      };
+      const safeClose = () => {
+        if (closed) return;
+        closed = true;
+        try { controller.close(); } catch { /* already closed */ }
       };
 
       try {
-        // Emit provider info
         send("activity", `Using ${searchConfig.provider === "local" ? `local LLM (${searchConfig.localModel})` : "Anthropic Cloud"} — batch size: ${searchConfig.enrichBatchSize}`);
 
-        // ── Phase 1: Generate queries ──
+        // ── Stage 1: Parse Boolean query ──
         send("progress", {
           phase: "generating",
-          detail: "Generating search queries...",
+          detail: "Parsing query...",
           progress: 5,
           counts: {},
         });
 
-        // Rule-based dork generation — instant, no LLM call needed
-        const dorks = generateDorksFromQuery(query);
+        // Parse Boolean from structured field or from raw query
+        const booleanInput = structuredBooleanQuery || query;
+        const parsed = parseBooleanQuery(booleanInput);
 
-        let allQueries = [...dorks];
-        if (wideNet) {
-          const crossPlatform = generateCrossPlatformQueries(query);
-          allQueries = [...dorks, ...crossPlatform];
+        console.log("[Search] Structured params:", {
+          query,
+          location: structuredLocation,
+          jobTitle: structuredJobTitle,
+          booleanQuery: structuredBooleanQuery?.slice(0, 80),
+        });
+        const meiliQuery = parsed.toMeilisearchQuery();
+
+        // Determine location: prefer structured, fallback to parsed from query
+        const locationMatch = query.match(/\b(?:in|at|from|near)\s+([A-Z][a-zA-Z\s,]+)/i);
+        const effectiveLocation = structuredLocation || locationMatch?.[1]?.trim();
+        const expandedLocations = effectiveLocation ? expandLocation(effectiveLocation) : undefined;
+
+        send("parsed_query", {
+          original: query,
+          meilisearchQuery: meiliQuery,
+          dorkCount: 0,
+        });
+
+        if (effectiveLocation) {
+          send("activity", `Location constraint: "${effectiveLocation}" (${expandedLocations?.length ?? 1} cities)`);
         }
 
-        send("queries", allQueries);
-        send("dork", dorks[0]);
+        // ── Stage 2: Orchestrated search (Serper + Apollo in parallel) ──
         send("progress", {
           phase: "generating",
-          detail: `Generated ${allQueries.length} search queries`,
-          progress: 15,
-          counts: { queries: allQueries.length },
+          detail: "Generating search queries...",
+          progress: 10,
+          counts: {},
         });
 
-        // ── Phase 2: Parallel search ──
+        const useSerper = sources.some((s) => ["linkedin", "github", "stackoverflow"].includes(s));
+        const useApollo = sources.includes("apollo") && !!process.env.APOLLO_API_KEY;
+
+        // Run Serper and Apollo in parallel
+        const pagesToFetch = Math.min(maxPages, 2);
+        const orchestrator = createOrchestrator();
+
+        const [serperResult, apolloResult] = await Promise.all([
+          useSerper
+            ? orchestrator.search(parsed, query, {
+                wideNet,
+                maxPages: pagesToFetch,
+                expandedLocations,
+                location: effectiveLocation,
+                jobTitle: structuredJobTitle,
+                booleanQuery: structuredBooleanQuery,
+                dorkBatch,
+                sources,
+              })
+            : Promise.resolve({ results: [] as SerperResult[], dorks: [] as string[] }),
+          useApollo
+            ? (async () => {
+                send("activity", "Searching Apollo database...");
+                const apolloParams = buildApolloSearchParams(
+                  structuredJobTitle,
+                  effectiveLocation,
+                  structuredBooleanQuery,
+                );
+                const apolloPage = dorkBatch + 1;
+                return searchApollo(apolloParams, apolloPage, 25);
+              })()
+            : Promise.resolve({ people: [] as ApolloPersonResult[], totalEntries: 0 }),
+        ]);
+
+        const { results: allResults, dorks } = serperResult;
+        const apolloPeople = apolloResult.people;
+
+        if (useApollo && apolloPeople.length > 0) {
+          send("activity", `Apollo returned ${apolloPeople.length} candidates`);
+        }
+
+        send("parsed_query", {
+          original: query,
+          meilisearchQuery: meiliQuery,
+          dorkCount: dorks.length,
+        });
+        if (dorks.length > 0) {
+          console.log("[Search] Generated dorks:", dorks);
+          send("queries", dorks);
+          send("dork", dorks[0]);
+        }
         send("progress", {
           phase: "searching",
-          detail: "Searching across all queries...",
-          progress: 20,
-          counts: { queries: allQueries.length },
+          detail: `Found ${allResults.length} raw results${apolloPeople.length > 0 ? ` + ${apolloPeople.length} from Apollo` : ""}`,
+          progress: 35,
+          counts: { queries: dorks.length, rawResults: allResults.length + apolloPeople.length },
         });
 
+        // ── Stage 3: Deduplicate + cache ──
         let supabase;
         try {
           supabase = createServerClient();
@@ -413,43 +393,41 @@ export async function POST(request: NextRequest) {
             message: "Supabase not configured. Set your env vars in .env.local",
           });
           send("done", { count: 0, hasMore: false, nextOffset: 0 });
-          controller.close();
+          safeClose();
           return;
         }
 
-        const pagesToFetch = offset > 0 ? 1 : maxPages;
-
-        const allResults: SerperResult[] = [];
-        await Promise.all(
-          allQueries.map(async (q) => {
-            try {
-              const results =
-                pagesToFetch > 1 && offset === 0
-                  ? await searchGoogleMultiPage(q, pagesToFetch, 10)
-                  : await searchGoogle(q, 10);
-              allResults.push(...results);
-            } catch (err) {
-              console.error(`Query failed: ${q}`, err);
-            }
-          })
-        );
-
-        send("progress", {
-          phase: "searching",
-          detail: `Found ${allResults.length} raw results`,
-          progress: 35,
-          counts: { queries: allQueries.length, rawResults: allResults.length },
-        });
-
-        // ── Phase 3: Deduplicate + cache ──
         send("activity", `Deduplicating ${allResults.length} results...`);
         const deduplicated = deduplicateResults(allResults);
         let profileResults = deduplicated.filter(
           (r) =>
-            r.link.includes("linkedin.com/in/") ||
-            r.source === "github" ||
-            r.source === "stackoverflow"
+            (sources.includes("linkedin") && r.link.includes("linkedin.com/in/")) ||
+            (sources.includes("github") && r.source === "github") ||
+            (sources.includes("stackoverflow") && r.source === "stackoverflow")
         );
+
+        console.log(`[Search] ${profileResults.length} profile results after dedup. First 5:`, profileResults.slice(0, 5).map(r => ({ link: r.link, title: r.title.slice(0, 60) })));
+
+        // ── Server-side location filtering ──
+        // Drop results whose snippet clearly indicates a non-matching location
+        if (effectiveLocation && expandedLocations && expandedLocations.length > 0) {
+          const expandedLower = expandedLocations.map((c) => c.toLowerCase());
+          const locLower = effectiveLocation.toLowerCase();
+
+          const beforeCount = profileResults.length;
+          profileResults = profileResults.filter((r) => {
+            const text = `${r.title} ${r.snippet}`.toLowerCase();
+            // Keep if: snippet mentions any expanded city, OR no clear foreign location
+            const matchesLocation = expandedLower.some((city) => text.includes(city)) || text.includes(locLower);
+            // Also keep results where we can't determine location (no location info in snippet)
+            const hasForeignLocation = /\b(?:india|bangalore|bengaluru|hyderabad|pune|mumbai|chennai|delhi|noida|gurgaon|uk|london|canada|toronto|singapore|australia|sydney|nigeria|lagos|pakistan|karachi|lahore|philippines|manila|brazil|sao paulo|germany|berlin|france|paris|netherlands|amsterdam|kenya|nairobi)\b/i.test(text);
+            return matchesLocation || !hasForeignLocation;
+          });
+
+          if (beforeCount !== profileResults.length) {
+            send("activity", `Location filter: dropped ${beforeCount - profileResults.length} non-local results (${profileResults.length} remaining)`);
+          }
+        }
 
         // ── Auto-relax: retry with broader query if 0 results ──
         if (profileResults.length === 0) {
@@ -458,10 +436,31 @@ export async function POST(request: NextRequest) {
             phase: "searching",
             detail: "Retrying with broader query...",
             progress: 38,
-            counts: { queries: allQueries.length, rawResults: 0 },
+            counts: { queries: dorks.length, rawResults: 0 },
           });
 
-          const relaxedDorks = generateRelaxedDorks(query);
+          // Smart boolean relaxation: remove NOT clauses first, then drop last AND term
+          let relaxedBooleanQuery = structuredBooleanQuery;
+          if (relaxedBooleanQuery) {
+            const withoutNot = relaxedBooleanQuery
+              .replace(/\bNOT\s+"[^"]+"/gi, "")
+              .replace(/\bNOT\s+\S+/gi, "")
+              .replace(/\s+/g, " ")
+              .trim();
+
+            if (withoutNot !== relaxedBooleanQuery && withoutNot.length > 0) {
+              send("activity", "Removed NOT clauses from boolean query for broader match");
+              relaxedBooleanQuery = withoutNot;
+            } else {
+              const andTerms = relaxedBooleanQuery.split(/\bAND\b/i).map((t) => t.trim()).filter(Boolean);
+              if (andTerms.length > 1) {
+                relaxedBooleanQuery = andTerms.slice(0, -1).join(" AND ");
+                send("activity", `Dropped last AND term, searching with: ${relaxedBooleanQuery.slice(0, 80)}...`);
+              }
+            }
+          }
+
+          const relaxedDorks = generateRelaxedDorks(query, effectiveLocation, structuredJobTitle, relaxedBooleanQuery);
           const relaxedResults: SerperResult[] = [];
           await Promise.all(
             relaxedDorks.map(async (q) => {
@@ -476,19 +475,20 @@ export async function POST(request: NextRequest) {
 
           const relaxedDeduped = deduplicateResults(relaxedResults);
           const relaxedProfiles = relaxedDeduped.filter(
-            (r) => r.link.includes("linkedin.com/in/") || r.source === "github" || r.source === "stackoverflow"
+            (r) =>
+              (sources.includes("linkedin") && r.link.includes("linkedin.com/in/")) ||
+              (sources.includes("github") && r.source === "github") ||
+              (sources.includes("stackoverflow") && r.source === "stackoverflow")
           );
 
           if (relaxedProfiles.length === 0) {
             send("status", "No profiles found even after broadening search. Try different keywords.");
             send("done", { count: 0, hasMore: false, nextOffset: 0 });
-            try { controller.close(); } catch { /* ok */ }
+            safeClose();
             return;
           }
 
-          // Replace empty results with relaxed results
           profileResults.push(...relaxedProfiles);
-          allResults.push(...relaxedResults);
           send("activity", `Auto-relax found ${relaxedProfiles.length} profiles with broader query`);
         }
 
@@ -502,6 +502,7 @@ export async function POST(request: NextRequest) {
           },
         });
 
+        // Send previews
         for (const r of profileResults) {
           send("preview", {
             id: `preview-${Buffer.from(r.link).toString("base64url")}`,
@@ -512,11 +513,14 @@ export async function POST(request: NextRequest) {
           });
         }
 
+        // ── Stage 4: Filter cached candidates ──
         const profileUrls = profileResults.map((r) => r.link);
         const { cached: cachedUrls, toProcess } =
           await filterExistingCandidates(supabase as never, profileUrls);
 
         let processedCount = 0;
+        const allCandidates: Candidate[] = [];
+
         if (cachedUrls.length > 0) {
           send("activity", `Loading ${cachedUrls.length} cached candidates (zero-latency)...`);
           const { data: cachedCandidates } = await supabase
@@ -527,6 +531,7 @@ export async function POST(request: NextRequest) {
           if (cachedCandidates) {
             for (const c of cachedCandidates) {
               processedCount++;
+              allCandidates.push(c as Candidate);
               send("candidate", c);
             }
           }
@@ -543,19 +548,19 @@ export async function POST(request: NextRequest) {
           },
         });
 
-        // Non-blocking history save (only use columns that exist in schema)
+        // Non-blocking history save
         supabase
           .from("search_history")
           .insert({
             natural_language_query: query,
-            generated_dork: dorks[0],
+            generated_dork: dorks[0] || query,
             result_count: profileResults.length,
           })
           .then(({ error }) => {
             if (error) console.error("Failed to save search history:", error);
           });
 
-        // ── Phase 4: Create candidates from snippets (instant, no scraping) ──
+        // ── Stage 5: Create Layer 1 candidates from snippets ──
         const toCreate = profileResults.filter((r) =>
           toProcess.includes(r.link)
         );
@@ -574,7 +579,6 @@ export async function POST(request: NextRequest) {
             },
           });
 
-          // Process all snippets in parallel (no scraping = instant)
           const BATCH_SIZE = 20;
           for (let i = 0; i < toCreate.length; i += BATCH_SIZE) {
             const batch = toCreate.slice(i, i + BATCH_SIZE);
@@ -587,14 +591,112 @@ export async function POST(request: NextRequest) {
             for (const candidate of results) {
               if (candidate) {
                 processedCount++;
+                allCandidates.push(candidate);
                 send("candidate", candidate);
               }
             }
           }
         }
 
-        // ── Phase 5: Done ──
-        const hasMore = profileResults.length >= maxPages * 10;
+        // ── Stage 5b: Create candidates from Apollo results ──
+        if (apolloPeople.length > 0) {
+          // Cross-source dedup: skip Apollo people already found via Serper
+          const serperNames = new Set(
+            allCandidates.map((c) => {
+              const firstName = c.full_name.split(/\s+/)[0]?.toLowerCase() || "";
+              const org = (c.current_company || "").toLowerCase();
+              return `${firstName}::${org}`;
+            })
+          );
+
+          const uniqueApollo = apolloPeople.filter((p) => {
+            const key = `${p.first_name.toLowerCase()}::${(p.organization?.name || "").toLowerCase()}`;
+            return !serperNames.has(key);
+          });
+
+          if (uniqueApollo.length < apolloPeople.length) {
+            send("activity", `Cross-source dedup: filtered ${apolloPeople.length - uniqueApollo.length} Apollo duplicates`);
+          }
+
+          if (uniqueApollo.length > 0) {
+            send("activity", `Creating ${uniqueApollo.length} candidates from Apollo...`);
+            const apolloBatchSize = 20;
+            for (let i = 0; i < uniqueApollo.length; i += apolloBatchSize) {
+              const batch = uniqueApollo.slice(i, i + apolloBatchSize);
+              const results = await Promise.all(
+                batch.map((person) =>
+                  createFromApollo(person, query, supabase).catch(() => null)
+                )
+              );
+
+              for (const candidate of results) {
+                if (candidate) {
+                  processedCount++;
+                  allCandidates.push(candidate);
+                  send("candidate", candidate);
+                }
+              }
+            }
+          }
+        }
+
+        // ── Stage 6: Index in Meilisearch ──
+        try {
+          await indexCandidates(
+            allCandidates.map((c) => ({
+              ...c,
+              is_job_hopper: c.is_job_hopper ?? false,
+            }))
+          );
+          send("activity", `Indexed ${allCandidates.length} candidates in Meilisearch`);
+        } catch (err) {
+          // Meilisearch is optional — log but don't fail
+          console.error("Meilisearch indexing failed (non-fatal):", err);
+          send("activity", "Meilisearch indexing skipped (not running)");
+        }
+
+        // ── Stage 7: Boolean re-rank with location boost ──
+        const rankedIds = allCandidates
+          .map((c) => {
+            const text = [
+              c.full_name,
+              c.headline,
+              c.current_title,
+              c.current_company,
+              c.location,
+              ...(c.tech_stack || []),
+            ].filter(Boolean).join(" ");
+
+            const booleanScore = parsed.scoreCandidate(text);
+            const fitScore = c.fit_score ?? 0;
+
+            // Location relevance bonus/penalty
+            let locationBonus = 0;
+            if (effectiveLocation) {
+              if (isLocationMatch(c.location || "", effectiveLocation)) {
+                locationBonus = 40; // Strong boost for matching location
+              } else if (c.location) {
+                locationBonus = -30; // Heavy penalty for wrong location when location was specified
+              }
+              // No location data = small penalty (prefer candidates we can verify)
+              if (!c.location) {
+                locationBonus = -5;
+              }
+            }
+
+            return {
+              id: c.id,
+              combinedScore: booleanScore * 0.4 + fitScore * 0.3 + locationBonus + 30,
+            };
+          })
+          .sort((a, b) => b.combinedScore - a.combinedScore)
+          .map((r) => r.id);
+
+        send("reranked", rankedIds);
+
+        // ── Stage 8: Done ──
+        const hasMore = dorkBatch < 2;
+        const nextDorkBatch = dorkBatch + 1;
         const nextOffset = offset + profileResults.length;
 
         send("progress", {
@@ -609,7 +711,7 @@ export async function POST(request: NextRequest) {
           },
         });
 
-        send("done", { count: processedCount, hasMore, nextOffset });
+        send("done", { count: processedCount, hasMore, nextOffset, nextDorkBatch });
       } catch (error) {
         console.error("Search pipeline error:", error);
         send("error", {
@@ -617,7 +719,7 @@ export async function POST(request: NextRequest) {
             error instanceof Error ? error.message : "Search pipeline failed",
         });
       } finally {
-        try { controller.close(); } catch { /* already closed */ }
+        safeClose()
       }
     },
   });

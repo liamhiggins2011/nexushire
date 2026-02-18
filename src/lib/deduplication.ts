@@ -1,7 +1,7 @@
 import { SerperResult } from "@/types";
 
 interface DeduplicatedResult extends SerperResult {
-  source: "linkedin" | "github" | "stackoverflow";
+  source: "linkedin" | "github" | "stackoverflow" | "apollo";
   linkedProfiles?: { platform: string; url: string }[];
 }
 
@@ -24,7 +24,8 @@ export function extractNameFromTitle(title: string): string {
     .toLowerCase();
 }
 
-function detectSource(url: string): "linkedin" | "github" | "stackoverflow" {
+function detectSource(url: string): "linkedin" | "github" | "stackoverflow" | "apollo" {
+  if (url.startsWith("apollo://")) return "apollo";
   if (url.includes("linkedin.com")) return "linkedin";
   if (url.includes("github.com")) return "github";
   if (url.includes("stackoverflow.com")) return "stackoverflow";

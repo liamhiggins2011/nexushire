@@ -27,7 +27,18 @@ export interface Candidate {
   career_narrative: string | null;
   inferred_intent: string | null;
   intent_confidence: "high" | "medium" | "low" | null;
+  profile_photo_url: string | null;
   deep_dive_data: DeepDiveData | null;
+  is_job_hopper: boolean | null;
+  job_hopper_reason: string | null;
+  enrichment_source: "apollo" | "apollo_search" | "firecrawl" | "snippet" | null;
+  apollo_id: string | null;
+  hydration_layer: number;
+  matched_terms?: string[] | null;
+  about_section: string | null;
+  certifications: string[] | null;
+  languages: string[] | null;
+  volunteer_work: VolunteerEntry[] | null;
   created_at: string;
   updated_at: string;
 }
@@ -59,6 +70,12 @@ export interface DeepDiveData {
   enriched_at: string;
 }
 
+export interface VolunteerEntry {
+  role: string;
+  organization: string;
+  description?: string;
+}
+
 export interface StructuredProfile {
   full_name: string;
   current_role: string;
@@ -75,7 +92,12 @@ export interface StructuredProfile {
     start_date: string | null;
     end_date: string | null;
     months: number;
+    description?: string;
   }[];
+  about_section: string | null;
+  certifications: string[];
+  languages: string[];
+  volunteer_work: VolunteerEntry[];
   stability_score: number;
   growth_velocity: number;
 }
@@ -130,8 +152,14 @@ export interface SearchHistory {
 }
 
 export interface SearchStreamEvent {
-  type: "status" | "dork" | "candidate" | "error" | "done";
+  type: "status" | "dork" | "candidate" | "error" | "done" | "parsed_query" | "reranked";
   data: string | Candidate | { message: string };
+}
+
+export interface ParsedQueryInfo {
+  original: string;
+  meilisearchQuery: string;
+  dorkCount: number;
 }
 
 export interface SerperResult {
@@ -139,6 +167,7 @@ export interface SerperResult {
   link: string;
   snippet: string;
   position: number;
+  thumbnailUrl?: string;
 }
 
 export interface SearchProgressEvent {
@@ -159,17 +188,55 @@ export interface PreviewCandidate {
   name: string;
   snippet: string;
   url: string;
-  source: "linkedin" | "github" | "stackoverflow";
+  source: "linkedin" | "github" | "stackoverflow" | "apollo";
 }
 
 export interface EnterpriseSearchRequest {
   query: string;
+  location?: string;
+  jobTitle?: string;
+  booleanQuery?: string;
   wideNet?: boolean;
   maxPages?: number;
   offset?: number;
 }
 
 export type CompanyPedigreeFilter = "faang" | "unicorn" | "yc" | "all";
+
+export type SearchSource = "linkedin" | "github" | "stackoverflow" | "apollo";
+
+export interface ApolloSearchParams {
+  person_titles?: string[];
+  person_locations?: string[];
+  q_keywords?: string;
+  person_seniorities?: string[];
+  page?: number;
+  per_page?: number;
+}
+
+export interface ApolloPersonResult {
+  id: string;
+  first_name: string;
+  last_name: string;
+  name: string;
+  title: string | null;
+  headline: string | null;
+  photo_url: string | null;
+  city: string | null;
+  state: string | null;
+  country: string | null;
+  organization: {
+    name: string | null;
+    website_url: string | null;
+  } | null;
+  seniority: string | null;
+}
+
+export interface BooleanBlock {
+  id: string;
+  type: "term" | "phrase" | "operator" | "not" | "group_start" | "group_end";
+  value: string;
+}
 
 export type SecurityClearance = "any" | "ts_sci" | "ts" | "secret" | "public_trust";
 
@@ -189,4 +256,6 @@ export interface SearchFilters {
   securityClearance: SecurityClearance;
   likelyToMove: boolean | null;
   diversitySignals: boolean | null;
+  minCurrentCompanyYears: number;
+  maxCurrentCompanyYears: number;
 }
